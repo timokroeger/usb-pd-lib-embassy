@@ -1,4 +1,5 @@
 use bilge::prelude::*;
+use defmt::{debug, trace, warn};
 use embassy_stm32::ucpd::{Instance, PdPhy, RxError, TxError};
 
 #[bitsize(4)]
@@ -110,25 +111,35 @@ impl<'d, T: Instance> ProtocolEngine<'d, T> {
                 Err(RxError::Crc | RxError::Overrun) => continue,
                 // Forward hard reset errors to caller.
                 Err(RxError::HardReset) => {
-                    self.reset();
-                    return Err(Error::HardReset);
+                    self.handle_hard_reset()?;
+                    unreachable!()
                 }
             };
 
             // Check message length.
             if n < 2 {
+                warn!("RX {=[u8]:x} message too short", self.buf[..n]);
                 continue;
             }
             let rx_header = Header::from(u16::from_le_bytes([self.buf[0], self.buf[1]]));
-            if n != 2 + 4 * usize::from(rx_header.number_of_data_objects().value()) {
+            let expected_len = 2 + 4 * usize::from(rx_header.number_of_data_objects().value());
+            if n != expected_len {
+                warn!(
+                    "RX {=[u8]:x} invalid message length, expected {=usize} bytes",
+                    self.buf[..n],
+                    expected_len,
+                );
                 continue;
             }
+
+            trace!("RX {=[u8]:x}", self.buf[..n]);
 
             if n == 2
                 && ControlMessageType::from(rx_header.message_type())
                     == ControlMessageType::SoftReset
             {
-                self.reset();
+                debug!("RX SoftReset");
+                self.message_id = None;
             }
 
             // Construct and transmit a GoodCRC response with a matching message id.
@@ -136,20 +147,17 @@ impl<'d, T: Instance> ProtocolEngine<'d, T> {
             goodcrc_header.set_message_type(ControlMessageType::GoodCRC.into());
             goodcrc_header.set_message_id(rx_header.message_id());
 
-            match self
-                .phy
-                .transmit(goodcrc_header.value.to_le_bytes().as_slice())
-                .await
-            {
+            let tx_buf = goodcrc_header.value.to_le_bytes();
+            match self.phy.transmit(&tx_buf).await {
                 // Cannot send GoodCRC, ignore received data and wait for retransmission.
-                Err(TxError::Discarded) => continue,
-                // Forward hard reset errors to caller.
-                Err(TxError::HardReset) => {
-                    self.reset();
-                    return Err(Error::HardReset);
+                Err(TxError::Discarded) => {
+                    warn!("TX {=[u8]:x} GoodCRC Discarded", tx_buf);
+                    continue;
                 }
+                // Forward hard reset errors to caller.
+                Err(TxError::HardReset) => self.handle_hard_reset()?,
                 // Good transmission
-                Ok(()) => {}
+                Ok(()) => trace!("TX {=[u8]:x} GoodCRC", tx_buf),
             }
 
             // Perform message deduplicated based on message id.
@@ -162,7 +170,9 @@ impl<'d, T: Instance> ProtocolEngine<'d, T> {
         }
     }
 
-    fn reset(&mut self) {
+    fn handle_hard_reset(&mut self) -> Result<(), Error> {
+        debug!("HardReset");
         self.message_id = None;
+        Err(Error::HardReset)
     }
 }
