@@ -1,73 +1,14 @@
 use bilge::prelude::*;
-use defmt::{debug, trace, warn};
+use defmt::{debug, trace, warn, Format};
 use embassy_stm32::ucpd::{Instance, PdPhy, RxError, TxError};
+use safe_transmute::transmute_to_bytes_mut;
 
-#[bitsize(4)]
-#[derive(FromBits, Debug, Clone, Copy, PartialEq)]
-pub enum ControlMessageType {
-    GoodCRC = 0x1,
-    GotoMin = 0x2,
-    Accept = 0x3,
-    Reject = 0x4,
-    Ping = 0x5,
-    PsRdy = 0x6,
-    GetSourceCap = 0x7,
-    GetSinkCap = 0x8,
-    DrSwap = 0x9,
-    PrSwap = 0xA,
-    VconnSwap = 0xB,
-    Wait = 0xC,
-    SoftReset = 0xD,
-    #[fallback]
-    Reserved,
-}
+use crate::protocol::*;
 
-#[bitsize(4)]
-#[derive(FromBits, Debug, Clone, Copy, PartialEq)]
-pub enum DataMessageType {
-    SourceCapabilites = 0x1,
-    Request = 0x2,
-    Bist = 0x3,
-    SinkCapabilities = 0x4,
-    VenderDefined = 0xF,
-    #[fallback]
-    Reserved,
-}
-
-#[bitsize(1)]
-#[derive(FromBits, Debug, Clone, Copy, PartialEq)]
-pub enum PortDataRole {
-    UpstreamFacingPort,
-    DownstreamFacingPort,
-}
-
-#[bitsize(2)]
-#[derive(FromBits, Debug, Clone, Copy, PartialEq)]
-pub enum SpecificationRevision {
-    Revision1_0,
-    Revision2_0,
-    #[fallback]
-    Reserved,
-}
-
-#[bitsize(1)]
-#[derive(FromBits, Debug, Clone, Copy, PartialEq)]
-pub enum PortPowerRole {
-    Sink,
-    Source,
-}
-
-#[bitsize(16)]
-#[derive(FromBits, DebugBits, Clone, Copy)]
-pub struct Header {
-    message_type: u4,
-    _reserved1: bool,
-    port_data_role: PortDataRole,
-    specification_revision: SpecificationRevision,
-    port_power_role: PortPowerRole,
-    message_id: u3,
-    number_of_data_objects: u3,
-    _reserved2: bool,
+#[derive(Debug, Format)]
+pub enum Message<'a> {
+    Control(ControlMessageType),
+    Data(DataMessageType, &'a [u32]),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -77,7 +18,7 @@ pub enum Error {
 
 pub struct ProtocolEngine<'d, T: Instance> {
     phy: PdPhy<'d, T>,
-    buf: [u8; 30],
+    buf: [u32; 8],
     message_id: Option<u3>,
     header_template: Header,
 }
@@ -86,7 +27,7 @@ impl<'d, T: Instance> ProtocolEngine<'d, T> {
     pub fn new(phy: PdPhy<'d, T>) -> Self {
         Self {
             phy,
-            buf: [0; 30],
+            buf: [0; 8],
             message_id: None,
             // TODO: make configurable
             header_template: Header::new(
@@ -102,9 +43,14 @@ impl<'d, T: Instance> ProtocolEngine<'d, T> {
         }
     }
 
-    pub async fn receive(&mut self) -> Result<&[u8], Error> {
+    pub async fn receive(&mut self) -> Result<Message, Error> {
         loop {
-            let n = match self.phy.receive(&mut self.buf).await {
+            // Skip the first to bytes so that the header goes into byte 3 and 4
+            // and the data starts at a 4 byte alignment which allows it to be
+            // transmuted to &[u32].
+            let buf = &mut transmute_to_bytes_mut(&mut self.buf)[2..];
+
+            let n = match self.phy.receive(buf).await {
                 // Good reception, save received size.
                 Ok(n) => n,
                 // Ignore incomplete messages and messages with invalid CRC.
@@ -118,55 +64,59 @@ impl<'d, T: Instance> ProtocolEngine<'d, T> {
 
             // Check message length.
             if n < 2 {
-                warn!("RX {=[u8]:x} message too short", self.buf[..n]);
+                warn!("RX {=[u8]:x} message too short", buf);
                 continue;
             }
-            let rx_header = Header::from(u16::from_le_bytes([self.buf[0], self.buf[1]]));
-            let expected_len = 2 + 4 * usize::from(rx_header.number_of_data_objects().value());
+            let rx_header = Header::from(u16::from_le_bytes([buf[0], buf[1]]));
+            let num_objects = usize::from(rx_header.number_of_data_objects().value());
+            let expected_len = 2 + 4 * num_objects;
             if n != expected_len {
                 warn!(
                     "RX {=[u8]:x} invalid message length, expected {=usize} bytes",
-                    self.buf[..n],
+                    buf[..n],
                     expected_len,
                 );
                 continue;
             }
 
-            trace!("RX {=[u8]:x}", self.buf[..n]);
-
-            if n == 2
-                && ControlMessageType::from(rx_header.message_type())
-                    == ControlMessageType::SoftReset
-            {
-                debug!("RX SoftReset");
-                self.message_id = None;
-            }
+            trace!("RX {=[u8]:x}", buf[..n]);
 
             // Construct and transmit a GoodCRC response with a matching message id.
             let mut goodcrc_header = self.header_template;
             goodcrc_header.set_message_type(ControlMessageType::GoodCRC.into());
             goodcrc_header.set_message_id(rx_header.message_id());
 
-            let tx_buf = goodcrc_header.value.to_le_bytes();
+            let tx_buf = u16::from(goodcrc_header).to_le_bytes();
             match self.phy.transmit(&tx_buf).await {
                 // Cannot send GoodCRC, ignore received data and wait for retransmission.
-                Err(TxError::Discarded) => {
-                    warn!("TX {=[u8]:x} GoodCRC Discarded", tx_buf);
-                    continue;
-                }
+                Err(TxError::Discarded) => warn!("TX {=[u8]:x} GoodCRC Discarded", tx_buf),
                 // Forward hard reset errors to caller.
                 Err(TxError::HardReset) => self.handle_hard_reset()?,
                 // Good transmission
                 Ok(()) => trace!("TX {=[u8]:x} GoodCRC", tx_buf),
             }
 
+            let is_softreset = num_objects == 0
+                && rx_header.message_type() == ControlMessageType::SoftReset.into();
+
             // Perform message deduplicated based on message id.
-            if self.message_id == Some(rx_header.message_id()) {
+            // Skip check for soft reset messages which have a message id of 0.
+            if !is_softreset && self.message_id == Some(rx_header.message_id()) {
+                debug!("RX duplicate message");
                 continue;
             }
             self.message_id = Some(rx_header.message_id());
 
-            return Ok(&self.buf[..n]);
+            return Ok(if num_objects == 0 {
+                Message::Control(ControlMessageType::from(rx_header.message_type()))
+            } else {
+                let objects = &mut self.buf[1..1 + num_objects];
+                objects.iter_mut().map(|obj| *obj = obj.to_le());
+                Message::Data(
+                    DataMessageType::from(rx_header.message_type()),
+                    objects,
+                )
+            });
         }
     }
 
