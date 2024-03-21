@@ -11,10 +11,8 @@ pub enum Message<'a> {
     Data(DataMessageType, &'a [u32]),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Error {
-    HardReset,
-}
+#[derive(Debug, Format, Clone, Copy)]
+pub struct HardReset;
 
 pub struct ProtocolEngine<'d, T: Instance> {
     phy: PdPhy<'d, T>,
@@ -120,9 +118,10 @@ impl<'d, T: Instance> ProtocolEngine<'d, T> {
         }
     }
 
-    fn handle_hard_reset(&mut self) -> Result<(), Error> {
+    fn handle_hard_reset(&mut self) -> Result<(), HardReset> {
         debug!("HardReset");
-        self.message_id = None;
-        Err(Error::HardReset)
+        self.rx_message_id = None;
+        self.tx_message_id = u3::new(0);
+        Err(HardReset)
     }
 }
