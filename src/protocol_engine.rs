@@ -1,9 +1,12 @@
 use bilge::prelude::*;
 use defmt::{debug, trace, warn, Format};
 use embassy_stm32::ucpd::{Instance, PdPhy, RxError, TxError};
+use embassy_time::{with_timeout, Duration, TimeoutError};
 use safe_transmute::transmute_to_bytes_mut;
 
 use crate::protocol::*;
+
+const RETRY_COUNT: usize = 3;
 
 #[derive(Debug, Format)]
 pub enum Message<'a> {
@@ -17,7 +20,8 @@ pub struct HardReset;
 pub struct ProtocolEngine<'d, T: Instance> {
     phy: PdPhy<'d, T>,
     buf: [u32; 8],
-    message_id: Option<u3>,
+    rx_message_id: Option<u3>,
+    tx_message_id: u3,
     header_template: Header,
 }
 
@@ -26,7 +30,8 @@ impl<'d, T: Instance> ProtocolEngine<'d, T> {
         Self {
             phy,
             buf: [0; 8],
-            message_id: None,
+            rx_message_id: None,
+            tx_message_id: u3::new(0),
             // TODO: make configurable
             header_template: Header::new(
                 u4::new(0),
@@ -41,7 +46,7 @@ impl<'d, T: Instance> ProtocolEngine<'d, T> {
         }
     }
 
-    pub async fn receive(&mut self) -> Result<Message, Error> {
+    pub async fn receive(&mut self) -> Result<Message, HardReset> {
         loop {
             // Skip the first to bytes so that the header goes into byte 3 and 4
             // and the data starts at a 4 byte alignment which allows it to be
@@ -94,28 +99,105 @@ impl<'d, T: Instance> ProtocolEngine<'d, T> {
                 Ok(()) => trace!("TX {=[u8]:x} GoodCRC", tx_buf),
             }
 
-            let is_softreset = num_objects == 0
-                && rx_header.message_type() == ControlMessageType::SoftReset.into();
+            // Handle soft reset.
+            if num_objects == 0 && rx_header.message_type() == ControlMessageType::SoftReset.into()
+            {
+                self.rx_message_id = None;
+                self.tx_message_id = u3::new(0);
+            }
 
             // Perform message deduplicated based on message id.
-            // Skip check for soft reset messages which have a message id of 0.
-            if !is_softreset && self.message_id == Some(rx_header.message_id()) {
+            if self.rx_message_id == Some(rx_header.message_id()) {
                 debug!("RX duplicate message");
                 continue;
             }
-            self.message_id = Some(rx_header.message_id());
+            self.rx_message_id = Some(rx_header.message_id());
 
             return Ok(if num_objects == 0 {
                 Message::Control(ControlMessageType::from(rx_header.message_type()))
             } else {
                 let objects = &mut self.buf[1..1 + num_objects];
-                objects.iter_mut().map(|obj| *obj = obj.to_le());
-                Message::Data(
-                    DataMessageType::from(rx_header.message_type()),
-                    objects,
-                )
+                for obj in &mut *objects {
+                    *obj = obj.to_le();
+                }
+                Message::Data(DataMessageType::from(rx_header.message_type()), objects)
             });
         }
+    }
+
+    pub async fn transmit(&mut self, msg: &Message<'_>) -> Result<bool, HardReset> {
+        if let Message::Control(ControlMessageType::SoftReset) = msg {
+            self.rx_message_id = None;
+        }
+
+        let (msg_type, num_objects): (u4, usize) = match *msg {
+            Message::Control(hdr) => (hdr.into(), 0),
+            Message::Data(hdr, data) => {
+                self.buf[1..1 + data.len()].copy_from_slice(data);
+                (hdr.into(), data.len())
+            }
+        };
+
+        let mut tx_header = self.header_template;
+        tx_header.set_message_id(self.tx_message_id);
+        tx_header.set_message_type(msg_type);
+        tx_header.set_number_of_data_objects(u3::new(num_objects as _));
+
+        let mut ok = false;
+        for _retry in 0..=RETRY_COUNT {
+            // Skip the first to bytes to put the header right before the data objects.
+            // Transmuting must be done inside the loop to please the borrow checker.
+            let buf = &mut transmute_to_bytes_mut(&mut self.buf)[2..2 + 2 + 4 * num_objects];
+            [buf[0], buf[1]] = u16::from(tx_header).to_le_bytes();
+
+            trace!("TX {=[u8]:x} retry={=usize}", buf, _retry);
+            match self.phy.transmit(buf).await {
+                Ok(()) => {}
+                // Retry when line not idle.
+                Err(TxError::Discarded) => {
+                    warn!("TX {=[u8]:x} retry={=usize} discarded", buf, _retry);
+                    continue;
+                }
+                // Forward hard reset to caller.
+                Err(TxError::HardReset) => self.handle_hard_reset()?,
+            }
+
+            let mut goodcrc_buf = [0_u8; 2];
+            match with_timeout(Duration::from_millis(1), self.phy.receive(&mut goodcrc_buf)).await {
+                Ok(Ok(2)) => {
+                    let goodcrc =
+                        Header::from(u16::from_le_bytes([goodcrc_buf[0], goodcrc_buf[1]]));
+                    if goodcrc.number_of_data_objects() != u3::new(0)
+                        || goodcrc.message_type() != ControlMessageType::GoodCRC.into()
+                        || goodcrc.message_id() != self.tx_message_id
+                    {
+                        warn!(
+                            "TX retry={=usize} Received invalid GoodCRC message {=[u8]:x}",
+                            _retry, goodcrc_buf
+                        );
+                        continue;
+                    }
+                    trace!("RX {=[u8]:x} GoodCRC", goodcrc_buf);
+                    ok = true;
+                    break;
+                }
+                Ok(Ok(_)) | Ok(Err(RxError::Crc | RxError::Overrun)) => {
+                    warn!(
+                        "TX retry={=usize} Expected GoodCRC but received invalid data",
+                        _retry
+                    );
+                    continue;
+                }
+                Ok(Err(RxError::HardReset)) => self.handle_hard_reset()?,
+                Err(TimeoutError) => {
+                    warn!("TX retry={=usize} GoodCRC timeout", _retry);
+                    continue;
+                }
+            }
+        }
+
+        self.tx_message_id.wrapping_add(u3::new(1));
+        Ok(ok)
     }
 
     fn handle_hard_reset(&mut self) -> Result<(), HardReset> {
