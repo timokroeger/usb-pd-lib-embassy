@@ -8,6 +8,9 @@ use crate::protocol::*;
 
 const RETRY_COUNT: usize = 3;
 
+/// Time to wait for a GoodCRC messages
+const TIMEOUT_RECEIVE: Duration = Duration::from_millis(3);
+
 #[derive(Debug, Format, PartialEq)]
 pub enum Message<'o> {
     Control(ControlMessageType),
@@ -166,7 +169,7 @@ impl<'d, T: Instance> ProtocolEngine<'d, T> {
             }
 
             let mut goodcrc_buf = [0_u8; 2];
-            match with_timeout(Duration::from_millis(1), self.phy.receive(&mut goodcrc_buf)).await {
+            match with_timeout(TIMEOUT_RECEIVE, self.phy.receive(&mut goodcrc_buf)).await {
                 Ok(Ok(2)) => {
                     let goodcrc =
                         Header::from(u16::from_le_bytes([goodcrc_buf[0], goodcrc_buf[1]]));
