@@ -28,7 +28,7 @@ pub enum DataMessageType {
     Request = 0x2,
     Bist = 0x3,
     SinkCapabilities = 0x4,
-    VenderDefined = 0xF,
+    VendorDefined = 0xF,
     #[fallback]
     Reserved,
 }
