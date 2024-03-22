@@ -8,10 +8,10 @@ use crate::protocol::*;
 
 const RETRY_COUNT: usize = 3;
 
-#[derive(Debug, Format)]
-pub enum Message<'a> {
+#[derive(Debug, Format, PartialEq)]
+pub enum Message<'o> {
     Control(ControlMessageType),
-    Data(DataMessageType, &'a [u32]),
+    Data(DataMessageType, &'o [u32]),
 }
 
 #[derive(Debug, Format, Clone, Copy)]
@@ -19,7 +19,6 @@ pub struct HardReset;
 
 pub struct ProtocolEngine<'d, T: Instance> {
     phy: PdPhy<'d, T>,
-    buf: [u32; 8],
     rx_message_id: Option<u3>,
     tx_message_id: u3,
     header_template: Header,
@@ -29,7 +28,6 @@ impl<'d, T: Instance> ProtocolEngine<'d, T> {
     pub fn new(phy: PdPhy<'d, T>) -> Self {
         Self {
             phy,
-            buf: [0; 8],
             rx_message_id: None,
             tx_message_id: u3::new(0),
             // TODO: make configurable
@@ -46,12 +44,13 @@ impl<'d, T: Instance> ProtocolEngine<'d, T> {
         }
     }
 
-    pub async fn receive(&mut self) -> Result<Message, HardReset> {
+    pub async fn receive<'o>(&mut self, obj_buf: &'o mut [u32]) -> Result<Message<'o>, HardReset> {
         loop {
             // Skip the first to bytes so that the header goes into byte 3 and 4
             // and the data starts at a 4 byte alignment which allows it to be
             // transmuted to &[u32].
-            let buf = &mut transmute_to_bytes_mut(&mut self.buf)[2..];
+            let mut raw_buf = [0_u32; 8];
+            let buf = &mut transmute_to_bytes_mut(&mut raw_buf)[2..];
 
             let n = match self.phy.receive(buf).await {
                 // Good reception, save received size.
@@ -116,11 +115,14 @@ impl<'d, T: Instance> ProtocolEngine<'d, T> {
             return Ok(if num_objects == 0 {
                 Message::Control(ControlMessageType::from(rx_header.message_type()))
             } else {
-                let objects = &mut self.buf[1..1 + num_objects];
-                for obj in &mut *objects {
-                    *obj = obj.to_le();
+                let truncated_obj_len = obj_buf.len().min(num_objects);
+                for i in 0..obj_buf.len().min(num_objects) {
+                    obj_buf[i] = raw_buf[i + 1].to_le();
                 }
-                Message::Data(DataMessageType::from(rx_header.message_type()), objects)
+                Message::Data(
+                    DataMessageType::from(rx_header.message_type()),
+                    &obj_buf[..truncated_obj_len],
+                )
             });
         }
     }
@@ -130,10 +132,11 @@ impl<'d, T: Instance> ProtocolEngine<'d, T> {
             self.rx_message_id = None;
         }
 
+        let mut raw_buf = [0_u32; 8];
         let (msg_type, num_objects): (u4, usize) = match *msg {
             Message::Control(hdr) => (hdr.into(), 0),
             Message::Data(hdr, data) => {
-                self.buf[1..1 + data.len()].copy_from_slice(data);
+                raw_buf[1..1 + data.len()].copy_from_slice(data);
                 (hdr.into(), data.len())
             }
         };
@@ -147,7 +150,7 @@ impl<'d, T: Instance> ProtocolEngine<'d, T> {
         for _retry in 0..=RETRY_COUNT {
             // Skip the first to bytes to put the header right before the data objects.
             // Transmuting must be done inside the loop to please the borrow checker.
-            let buf = &mut transmute_to_bytes_mut(&mut self.buf)[2..2 + 2 + 4 * num_objects];
+            let buf = &mut transmute_to_bytes_mut(&mut raw_buf)[2..2 + 2 + 4 * num_objects];
             [buf[0], buf[1]] = u16::from(tx_header).to_le_bytes();
 
             trace!("TX {=[u8]:x} retry={=usize}", buf, _retry);
