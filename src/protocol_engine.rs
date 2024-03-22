@@ -115,7 +115,7 @@ impl<'d, T: Instance> ProtocolEngine<'d, T> {
             }
             self.rx_message_id = Some(rx_header.message_id());
 
-            return Ok(if num_objects == 0 {
+            let msg = if num_objects == 0 {
                 Message::Control(ControlMessageType::from(rx_header.message_type()))
             } else {
                 let truncated_obj_len = obj_buf.len().min(num_objects);
@@ -126,11 +126,15 @@ impl<'d, T: Instance> ProtocolEngine<'d, T> {
                     DataMessageType::from(rx_header.message_type()),
                     &obj_buf[..truncated_obj_len],
                 )
-            });
+            };
+            debug!("Received {}", msg);
+            return Ok(msg);
         }
     }
 
     pub async fn transmit(&mut self, msg: &Message<'_>) -> Result<bool, HardReset> {
+        debug!("Transmitting {}", msg);
+
         if let Message::Control(ControlMessageType::SoftReset) = msg {
             self.rx_message_id = None;
         }
@@ -206,8 +210,13 @@ impl<'d, T: Instance> ProtocolEngine<'d, T> {
         Ok(ok)
     }
 
+    pub async fn transmit_hard_reset(&mut self) {
+        debug!("Transmitting HardReset");
+        let _ = self.phy.transmit_hardreset().await;
+    }
+
     fn handle_hard_reset(&mut self) -> Result<(), HardReset> {
-        debug!("HardReset");
+        debug!("Received HardReset");
         self.rx_message_id = None;
         self.tx_message_id = u3::new(0);
         Err(HardReset)
