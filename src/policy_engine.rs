@@ -45,6 +45,7 @@ impl<'d, T: ucpd::Instance> PolicyEngine<'d, T> {
             let mut obj_buf = [0; 7];
             let msg = self.pe.receive(&mut obj_buf).await?;
             match msg {
+                Message::Control(ControlMessageType::Ping) => info!("Ignoring {}", msg),
                 Message::Data(DataMessageType::SourceCapabilites, _) => {
                     match self.power_negotiation().await {
                         Ok(true) => info!("Power Negotiation finished"),
@@ -64,8 +65,13 @@ impl<'d, T: ucpd::Instance> PolicyEngine<'d, T> {
                         }
                     }
                 }
-                // TODO: Reject unsupported messages
-                msg => info!("Ignoring message {}", msg),
+                Message::Data(DataMessageType::VendorDefined, _) => info!("Ignoring {}", msg),
+                msg => {
+                    info!("Rejecting unsupported message {}", msg);
+                    self.pe
+                        .transmit(&Message::Control(ControlMessageType::Reject))
+                        .await?;
+                }
             };
         }
     }
@@ -125,7 +131,9 @@ impl<'d, T: ucpd::Instance> PolicyEngine<'d, T> {
         let msg = with_timeout(TIMEOUT_SENDER_RESPONSE, self.receive(&mut [])).await??;
         match msg {
             Message::Control(ControlMessageType::Accept) => {}
-            Message::Control(ControlMessageType::Reject) => return Ok(false),
+            Message::Control(ControlMessageType::Reject | ControlMessageType::Wait) => {
+                return Ok(false)
+            }
             _ => return Err(Error::UnexpectedMessage(msg)),
         };
 
