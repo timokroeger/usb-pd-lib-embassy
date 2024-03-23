@@ -1,7 +1,7 @@
 use bilge::arbitrary_int::*;
 use defmt::*;
 use embassy_stm32::ucpd;
-use embassy_time::{with_timeout, Duration, TimeoutError};
+use embassy_time::{with_timeout, Duration};
 
 use crate::protocol::*;
 use crate::protocol_engine::{HardReset, Message, ProtocolEngine};
@@ -11,25 +11,6 @@ const TIMEOUT_SENDER_RESPONSE: Duration = Duration::from_millis(30);
 
 /// Time to wait for a PS_RDY message.
 const TIMEOUT_PS_TRANSITION: Duration = Duration::from_millis(500);
-
-#[derive(Debug, Format)]
-pub enum Error<'m> {
-    HardReset,
-    Timeout,
-    UnexpectedMessage(Message<'m>),
-}
-
-impl From<HardReset> for Error<'_> {
-    fn from(_: HardReset) -> Self {
-        Self::HardReset
-    }
-}
-
-impl From<TimeoutError> for Error<'_> {
-    fn from(_: TimeoutError) -> Self {
-        Self::Timeout
-    }
-}
 
 pub struct PolicyEngine<'d, T: ucpd::Instance> {
     pe: ProtocolEngine<'d, T>,
@@ -57,16 +38,10 @@ impl<'d, T: ucpd::Instance> PolicyEngine<'d, T> {
                 }
                 Message::Data(DataMessageType::SourceCapabilites, _) => {
                     info!("Source capablities received, starting power negotiation");
-                    match self.power_negotiation().await {
+                    match self.power_negotiation().await? {
                         Ok(true) => info!("Power negotiation finished"),
                         Ok(false) => info!("Power negotiation unsuccessful"),
-                        Err(Error::HardReset) => return Err(HardReset),
-                        Err(Error::Timeout) => {
-                            error!("timeout");
-                            self.transmit_hard_reset().await;
-                            return Err(HardReset);
-                        }
-                        Err(Error::UnexpectedMessage(msg)) => {
+                        Err(msg) => {
                             error!(
                                 "Received unexpected message {} during power negotiation",
                                 msg
@@ -78,29 +53,46 @@ impl<'d, T: ucpd::Instance> PolicyEngine<'d, T> {
                 Message::Data(DataMessageType::VendorDefined, _) => info!("Ignoring {}", msg),
                 msg => {
                     info!("Rejecting unsupported message {}", msg);
-                    self.pe
-                        .transmit(&Message::Control(ControlMessageType::Reject))
+                    self.transmit(&Message::Control(ControlMessageType::Reject))
                         .await?;
                 }
             };
         }
     }
 
-    async fn receive<'o>(&mut self, obj_buf: &'o mut [u32]) -> Result<Message<'o>, HardReset> {
-        let msg = self.pe.receive(obj_buf).await?;
+    async fn receive_timeout<'m>(&mut self, timeout: Duration) -> Result<Message<'m>, HardReset> {
+        let msg = with_timeout(timeout, self.pe.receive(&mut []))
+            .await
+            .map_err(|_| {
+                error!("Receive timeout");
+                HardReset
+            })??;
         if msg == Message::Control(ControlMessageType::SoftReset) {
             warn!("Received SoftReset, sending Accept");
-            self.pe
-                .transmit(&Message::Control(ControlMessageType::Accept))
+            self.transmit(&Message::Control(ControlMessageType::Accept))
                 .await?;
         }
         Ok(msg)
     }
 
+    async fn transmit(&mut self, msg: &Message<'_>) -> Result<bool, HardReset> {
+        let success = self.pe.transmit(msg).await?;
+        if !success {
+            self.transmit_soft_reset().await?;
+        }
+        Ok(success)
+    }
+
     async fn transmit_soft_reset(&mut self) -> Result<(), HardReset> {
-        self.pe
+        if !self
+            .pe
             .transmit(&Message::Control(ControlMessageType::SoftReset))
-            .await?;
+            .await?
+        {
+            error!("Error during SoftReset transmission");
+            self.transmit_hard_reset().await;
+            return Err(HardReset);
+        }
         let msg = with_timeout(TIMEOUT_SENDER_RESPONSE, self.pe.receive(&mut []))
             .await
             .map_err(|_| HardReset)??;
@@ -120,7 +112,7 @@ impl<'d, T: ucpd::Instance> PolicyEngine<'d, T> {
         self.pe.transmit_hard_reset().await;
     }
 
-    async fn power_negotiation(&mut self) -> Result<bool, Error> {
+    async fn power_negotiation(&mut self) -> Result<Result<bool, Message>, HardReset> {
         // TODO: simple constructor in protocol module.
         // default 5V
         let obj = Request::new(
@@ -134,28 +126,32 @@ impl<'d, T: ucpd::Instance> PolicyEngine<'d, T> {
             u3::new(1),
             false,
         );
-        self.pe
+        if !self
             .transmit(&Message::Data(DataMessageType::Request, &[obj.into()]))
-            .await?;
+            .await?
+        {
+            return Ok(Ok(false));
+        }
 
-        let msg = with_timeout(TIMEOUT_SENDER_RESPONSE, self.receive(&mut [])).await??;
+        let msg = self.receive_timeout(TIMEOUT_SENDER_RESPONSE).await?;
         match msg {
             Message::Control(ControlMessageType::Accept) => {}
             Message::Control(ControlMessageType::Reject | ControlMessageType::Wait) => {
-                return Ok(false)
+                return Ok(Ok(false))
             }
-            _ => return Err(Error::UnexpectedMessage(msg)),
+            Message::Control(ControlMessageType::SoftReset) => return Ok(Ok(false)),
+            _ => return Ok(Err(msg)),
         };
 
-        let msg = with_timeout(TIMEOUT_PS_TRANSITION, self.receive(&mut [])).await??;
-        if msg != Message::Control(ControlMessageType::PsRdy) {
-            return Err(Error::UnexpectedMessage(msg));
-        };
-
-        Ok(true)
+        let msg = self.receive_timeout(TIMEOUT_PS_TRANSITION).await?;
+        match msg {
+            Message::Control(ControlMessageType::PsRdy) => Ok(Ok(true)),
+            Message::Control(ControlMessageType::SoftReset) => Ok(Ok(false)),
+            _ => Ok(Err(msg)),
+        }
     }
 
-    async fn sink_capabilities(&mut self) -> Result<(), HardReset> {
+    async fn sink_capabilities(&mut self) -> Result<bool, HardReset> {
         // default 5V
         let obj = sink_capabilities::FixedSupply::new(
             self.operating_current,
@@ -168,12 +164,10 @@ impl<'d, T: ucpd::Instance> PolicyEngine<'d, T> {
             false,
             u2::new(0),
         );
-        self.pe
-            .transmit(&Message::Data(
-                DataMessageType::SinkCapabilities,
-                &[obj.into()],
-            ))
-            .await?;
-        Ok(())
+        self.transmit(&Message::Data(
+            DataMessageType::SinkCapabilities,
+            &[obj.into()],
+        ))
+        .await
     }
 }
