@@ -33,11 +33,16 @@ impl From<TimeoutError> for Error<'_> {
 
 pub struct PolicyEngine<'d, T: ucpd::Instance> {
     pe: ProtocolEngine<'d, T>,
+    operating_current: u10, // 10mA resoultion
 }
 
 impl<'d, T: ucpd::Instance> PolicyEngine<'d, T> {
-    pub fn new(pe: ProtocolEngine<'d, T>) -> Self {
-        Self { pe }
+    pub fn new(pe: ProtocolEngine<'d, T>, operating_current_ma: u16) -> Self {
+        Self {
+            pe,
+            // Round up to next 10mA step
+            operating_current: u10::new((operating_current_ma + 9) / 10),
+        }
     }
 
     pub async fn run(&mut self) -> Result<(), HardReset> {
@@ -46,10 +51,15 @@ impl<'d, T: ucpd::Instance> PolicyEngine<'d, T> {
             let msg = self.pe.receive(&mut obj_buf).await?;
             match msg {
                 Message::Control(ControlMessageType::Ping) => info!("Ignoring {}", msg),
+                Message::Control(ControlMessageType::GetSinkCap) => {
+                    info!("Sending sink capabilites");
+                    self.sink_capabilities().await?;
+                }
                 Message::Data(DataMessageType::SourceCapabilites, _) => {
+                    info!("Source capablities received, starting power negotiation");
                     match self.power_negotiation().await {
-                        Ok(true) => info!("Power Negotiation finished"),
-                        Ok(false) => info!("Power Negotiation unsuccessful"),
+                        Ok(true) => info!("Power negotiation finished"),
+                        Ok(false) => info!("Power negotiation unsuccessful"),
                         Err(Error::HardReset) => return Err(HardReset),
                         Err(Error::Timeout) => {
                             error!("timeout");
@@ -112,10 +122,10 @@ impl<'d, T: ucpd::Instance> PolicyEngine<'d, T> {
 
     async fn power_negotiation(&mut self) -> Result<bool, Error> {
         // TODO: simple constructor in protocol module.
-        // default 5V, operating and max current = 50mA
+        // default 5V
         let obj = Request::new(
-            u10::new(5),
-            u10::new(5),
+            self.operating_current,
+            self.operating_current,
             u4::new(0),
             false,
             false,
@@ -143,5 +153,27 @@ impl<'d, T: ucpd::Instance> PolicyEngine<'d, T> {
         };
 
         Ok(true)
+    }
+
+    async fn sink_capabilities(&mut self) -> Result<(), HardReset> {
+        // default 5V
+        let obj = sink_capabilities::FixedSupply::new(
+            self.operating_current,
+            u10::new(10), // 50mV resolution
+            u5::new(0),
+            false,
+            false,
+            false,
+            false,
+            false,
+            u2::new(0),
+        );
+        self.pe
+            .transmit(&Message::Data(
+                DataMessageType::SinkCapabilities,
+                &[obj.into()],
+            ))
+            .await?;
+        Ok(())
     }
 }

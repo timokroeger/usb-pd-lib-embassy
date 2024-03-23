@@ -116,7 +116,7 @@ fn main() -> ! {
 
             let (mut cc_phy, pd_phy) = ucpd.split_pd_phy(&p.DMA1_CH1, &mut p.DMA1_CH2, cc_sel);
             let protocol_engine = ProtocolEngine::new(pd_phy);
-            let mut policy_engine = PolicyEngine::new(protocol_engine);
+            let mut policy_engine = PolicyEngine::new(protocol_engine, 100);
 
             select(wait_detach(&mut cc_phy), async {
                 policy_engine.run().await
