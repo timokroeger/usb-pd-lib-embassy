@@ -13,14 +13,14 @@ const TIMEOUT_SENDER_RESPONSE: Duration = Duration::from_millis(30);
 const TIMEOUT_PS_TRANSITION: Duration = Duration::from_millis(500);
 
 pub struct PolicyEngine<'d, T: ucpd::Instance> {
-    pe: ProtocolEngine<'d, T>,
+    protocol_engine: ProtocolEngine<'d, T>,
     operating_current: u10, // 10mA resoultion
 }
 
 impl<'d, T: ucpd::Instance> PolicyEngine<'d, T> {
     pub fn new(pe: ProtocolEngine<'d, T>, operating_current_ma: u16) -> Self {
         Self {
-            pe,
+            protocol_engine: pe,
             // Round up to next 10mA step
             operating_current: u10::new((operating_current_ma + 9) / 10),
         }
@@ -29,7 +29,7 @@ impl<'d, T: ucpd::Instance> PolicyEngine<'d, T> {
     pub async fn run(&mut self) -> Result<(), HardReset> {
         loop {
             let mut obj_buf = [0; 7];
-            let msg = self.pe.receive(&mut obj_buf).await?;
+            let msg = self.protocol_engine.receive(&mut obj_buf).await?;
             match msg {
                 Message::Control(ControlMessageType::Ping) => info!("Ignoring {}", msg),
                 Message::Control(ControlMessageType::GetSinkCap) => {
@@ -61,7 +61,7 @@ impl<'d, T: ucpd::Instance> PolicyEngine<'d, T> {
     }
 
     async fn receive_timeout<'m>(&mut self, timeout: Duration) -> Result<Message<'m>, HardReset> {
-        let msg = with_timeout(timeout, self.pe.receive(&mut []))
+        let msg = with_timeout(timeout, self.protocol_engine.receive(&mut []))
             .await
             .map_err(|_| {
                 error!("Receive timeout");
@@ -76,7 +76,7 @@ impl<'d, T: ucpd::Instance> PolicyEngine<'d, T> {
     }
 
     async fn transmit(&mut self, msg: &Message<'_>) -> Result<bool, HardReset> {
-        let success = self.pe.transmit(msg).await?;
+        let success = self.protocol_engine.transmit(msg).await?;
         if !success {
             self.transmit_soft_reset().await?;
         }
@@ -85,7 +85,7 @@ impl<'d, T: ucpd::Instance> PolicyEngine<'d, T> {
 
     async fn transmit_soft_reset(&mut self) -> Result<(), HardReset> {
         if !self
-            .pe
+            .protocol_engine
             .transmit(&Message::Control(ControlMessageType::SoftReset))
             .await?
         {
@@ -93,9 +93,12 @@ impl<'d, T: ucpd::Instance> PolicyEngine<'d, T> {
             self.transmit_hard_reset().await;
             return Err(HardReset);
         }
-        let msg = with_timeout(TIMEOUT_SENDER_RESPONSE, self.pe.receive(&mut []))
-            .await
-            .map_err(|_| HardReset)??;
+        let msg = with_timeout(
+            TIMEOUT_SENDER_RESPONSE,
+            self.protocol_engine.receive(&mut []),
+        )
+        .await
+        .map_err(|_| HardReset)??;
         if msg != Message::Control(ControlMessageType::Accept) {
             error!(
                 "Expected Accept message in renspone to SoftReset, received {} instead",
@@ -109,7 +112,7 @@ impl<'d, T: ucpd::Instance> PolicyEngine<'d, T> {
 
     async fn transmit_hard_reset(&mut self) {
         // TODO: implement hard reset counter
-        self.pe.transmit_hard_reset().await;
+        self.protocol_engine.transmit_hard_reset().await;
     }
 
     async fn power_negotiation(&mut self) -> Result<Result<bool, Message>, HardReset> {
