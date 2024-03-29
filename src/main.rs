@@ -10,6 +10,7 @@ use core::pin::pin;
 
 use defmt::{panic, *};
 use embassy_futures::select::select;
+use embassy_stm32::gpio::{Level, Output, Speed};
 use embassy_stm32::rcc::{Hse, HseMode, Pll, PllMul, PllPreDiv, PllRDiv, PllSource, Sysclk};
 use embassy_stm32::time::mhz;
 use embassy_stm32::ucpd::{CcPhy, CcPull, CcSel, CcVState, Ucpd};
@@ -90,7 +91,7 @@ fn main() -> ! {
     let mut p = embassy_stm32::init(config);
     info!("Hello World!");
 
-    //let mut led = Output::new(p.PC6, Level::High, Speed::High);
+    let mut led = Output::new(p.PC6, Level::High, Speed::High);
     //let mut button = ExtiInput::new(p.PC13, p.EXTI13, Pull::Down);
 
     let my_task = pin!(async {
@@ -119,9 +120,12 @@ fn main() -> ! {
             let mut policy_engine = PolicyEngine::new(protocol_engine, 100);
 
             select(wait_detach(&mut cc_phy), async {
-                policy_engine.run().await
+                policy_engine.run_sink().await
             })
             .await;
+            //wait_detach(&mut cc_phy).await;
+
+            led.toggle();
         }
     });
 

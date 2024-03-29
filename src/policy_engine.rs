@@ -37,7 +37,7 @@ impl<'d, T: ucpd::Instance> PolicyEngine<'d, T> {
         }
     }
 
-    pub async fn run(&mut self) -> Result<(), HardReset> {
+    pub async fn run_sink(&mut self) -> Result<(), HardReset> {
         let mut ready = false;
         loop {
             let mut obj_buf = [0; 7];
@@ -139,7 +139,9 @@ impl<'d, T: ucpd::Instance> PolicyEngine<'d, T> {
     }
 
     async fn transmit_hard_reset(&mut self) {
-        // TODO: implement hard reset counter
+        // Hard reset counter not implemented because as a sink without
+        // battery we always lose power when the source disables vbus
+        // in response to hard reset.
         self.protocol_engine.transmit_hard_reset().await;
     }
 
